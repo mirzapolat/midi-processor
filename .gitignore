@@ -33,3 +33,5 @@ env/
 
 # Soundfonts are large — uncomment to exclude from git
 # soundfonts/
+
+.claude
