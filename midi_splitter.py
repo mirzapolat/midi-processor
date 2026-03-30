@@ -30,15 +30,15 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QLineEdit, QFileDialog,
     QScrollArea, QFrame, QMessageBox, QCheckBox, QSizePolicy,
-    QStackedWidget, QButtonGroup,
+    QStackedWidget, QButtonGroup, QProgressDialog,
 )
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Bundled soundfonts shipped alongside this script
-_SF_TRACKS    = os.path.join(_SCRIPT_DIR, "soundfonts", "UprightPianoKW-20220221.sf2")
-_SF_METRONOME = os.path.join(_SCRIPT_DIR, "soundfonts", "FluidR3 GM.sf2")
+_SF_TRACKS    = os.path.join(_SCRIPT_DIR, "soundfonts", "piano.sf2")
+_SF_METRONOME = os.path.join(_SCRIPT_DIR, "soundfonts", "metronome.sf2")
 
 # ---------------------------------------------------------------------------
 # Design system
@@ -226,16 +226,21 @@ def get_total_ticks(midi_file) -> int:
 def generate_metronome_track(ticks_per_beat: int, total_ticks: int) -> mido.MidiTrack:
     track = mido.MidiTrack()
     track.name = "Metronome"
-    note = 76
+    # metronome.sf2 has the woodblock as Bank 0 / Preset 115 (melodic, not percussion).
+    # Use channel 15 (unlikely to clash with piano tracks) and select that preset.
+    ch = 15
+    note = 60   # root pitch of the High Woodblock sample
     note_dur = max(5, ticks_per_beat // 8)
+    track.append(mido.Message("control_change", channel=ch, control=0, value=0, time=0))
+    track.append(mido.Message("program_change", channel=ch, program=115, time=0))
     last_tick = 0
     beat = 0
     while True:
         tick = beat * ticks_per_beat
         if tick > total_ticks + ticks_per_beat:
             break
-        track.append(mido.Message("note_on",  channel=9, note=note, velocity=100, time=tick - last_tick))
-        track.append(mido.Message("note_off", channel=9, note=note, velocity=0,   time=note_dur))
+        track.append(mido.Message("note_on",  channel=ch, note=note, velocity=100, time=tick - last_tick))
+        track.append(mido.Message("note_off", channel=ch, note=note, velocity=0,   time=note_dur))
         last_tick = tick + note_dur
         beat += 1
     return track
@@ -409,7 +414,10 @@ def _mix_wav_files(wav_paths: list[str], out_path: str) -> None:
         mixed[:len(arr)] += arr
     dtype = {1: np.int8, 2: np.int16, 4: np.int32}.get(params.sampwidth, np.int16)
     max_val = float(np.iinfo(dtype).max)
-    mixed = mixed.clip(-max_val, max_val).astype(dtype)
+    peak = np.abs(mixed).max()
+    if peak > max_val:
+        mixed = mixed * (max_val / peak)   # scale proportionally — no hard clipping
+    mixed = mixed.astype(dtype)
     with wave.open(out_path, "wb") as wf:
         wf.setparams(params)
         wf.writeframes(mixed.tobytes())
@@ -1330,10 +1338,10 @@ class MainWindow(QMainWindow):
         metro_vol_row.addWidget(mvl)
         self.metro_vol_slider = QSlider(Qt.Orientation.Horizontal)
         self.metro_vol_slider.setRange(1, 127)
-        self.metro_vol_slider.setValue(64)
+        self.metro_vol_slider.setValue(35)
         self.metro_vol_slider.setMinimumWidth(160)
         metro_vol_row.addWidget(self.metro_vol_slider)
-        self.metro_vol_lbl = QLabel("64")
+        self.metro_vol_lbl = QLabel("35")
         self.metro_vol_lbl.setFixedWidth(28)
         metro_vol_row.addWidget(self.metro_vol_lbl)
         self.metro_vol_slider.valueChanged.connect(
@@ -1728,8 +1736,24 @@ class MainWindow(QMainWindow):
                    self.mode_group.checkedId()]
 
         n_tracks = len(self.midi_file.tracks)
+        total = (1 if mode == "All Normal"
+                 else len(selected) * 2 if mode == "Both (Quiet + Silent)"
+                 else len(selected))
         count = 0
         errors = []
+
+        progress = QProgressDialog("Preparing…", "Cancel", 0, total, self)
+        progress.setWindowTitle("Exporting")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        def advance(label: str) -> bool:
+            """Update progress bar. Returns False if user cancelled."""
+            progress.setLabelText(f"Exporting: {label}")
+            progress.setValue(count)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
 
         def levels_for(active_idx, other_mode):
             """Build track-levels list. active_idx track is handled by build_output_midi.
@@ -1741,23 +1765,25 @@ class MainWindow(QMainWindow):
             return lvls
 
         if mode == "All Normal":
-            # Single file: all non-muted tracks at full volume
-            lvls = ["muted"] * n_tracks
-            for r in self.track_rows:
-                if r.get_level() != "muted":
-                    lvls[r.track_idx] = "normal"
-            out_midi = build_output_midi(
-                self.midi_file, -1, nv, qv, speed, lvls, metro_trk, metro_vel)
-            out_path = os.path.join(out_dir, f"{base}.{fmt}")
-            if self._save_midi_file(out_midi, out_path, fmt, errors, base):
-                count += 1
+            if advance(base):
+                lvls = ["muted"] * n_tracks
+                for r in self.track_rows:
+                    if r.get_level() != "muted":
+                        lvls[r.track_idx] = "normal"
+                out_midi = build_output_midi(
+                    self.midi_file, -1, nv, qv, speed, lvls, metro_trk, metro_vel)
+                out_path = os.path.join(out_dir, f"{base}.{fmt}")
+                if self._save_midi_file(out_midi, out_path, fmt, errors, base):
+                    count += 1
 
         elif mode == "Others Quiet":
             for row in selected:
+                name = row.get_export_name()
+                if not advance(name):
+                    break
                 lvls = levels_for(row.track_idx, "quiet")
                 out_midi = build_output_midi(
                     self.midi_file, row.track_idx, nv, qv, speed, lvls, metro_trk, metro_vel)
-                name = row.get_export_name()
                 out_path = os.path.join(out_dir, f"{base}_{name}.{fmt}")
                 if self._save_midi_file(out_midi, out_path, fmt, errors, name):
                     count += 1
@@ -1766,10 +1792,12 @@ class MainWindow(QMainWindow):
 
         elif mode == "Others Silent":
             for row in selected:
+                name = row.get_export_name()
+                if not advance(name):
+                    break
                 lvls = levels_for(row.track_idx, "muted")
                 out_midi = build_output_midi(
                     self.midi_file, row.track_idx, nv, qv, speed, lvls, metro_trk, metro_vel)
-                name = row.get_export_name()
                 out_path = os.path.join(out_dir, f"{base}_{name}.{fmt}")
                 if self._save_midi_file(out_midi, out_path, fmt, errors, name):
                     count += 1
@@ -1780,6 +1808,8 @@ class MainWindow(QMainWindow):
             for row in selected:
                 name = row.get_export_name()
 
+                if not advance(f"{name} (quiet)"):
+                    break
                 lvls_q = levels_for(row.track_idx, "quiet")
                 out_q = build_output_midi(
                     self.midi_file, row.track_idx, nv, qv, speed, lvls_q, metro_trk, metro_vel)
@@ -1788,6 +1818,8 @@ class MainWindow(QMainWindow):
                     break
                 count += 1
 
+                if not advance(f"{name} (silent)"):
+                    break
                 lvls_s = levels_for(row.track_idx, "muted")
                 out_s = build_output_midi(
                     self.midi_file, row.track_idx, nv, qv, speed, lvls_s, metro_trk, metro_vel)
@@ -1795,6 +1827,9 @@ class MainWindow(QMainWindow):
                 if not self._save_midi_file(out_s, path_s, fmt, errors, f"{name}_silent"):
                     break
                 count += 1
+
+        progress.setValue(total)
+        progress.close()
 
         if errors:
             QMessageBox.warning(self, "Some exports failed", "\n".join(errors))
