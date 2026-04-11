@@ -12,6 +12,7 @@ Optional:      brew install fluid-synth ffmpeg  (for WAV/MP3 export + audio prev
 
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,7 +29,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QSlider, QLineEdit, QFileDialog,
+    QLabel, QPushButton, QSlider, QLineEdit, QFileDialog, QComboBox,
     QScrollArea, QFrame, QMessageBox, QCheckBox, QSizePolicy,
     QStackedWidget, QButtonGroup, QProgressDialog,
 )
@@ -223,16 +224,22 @@ def get_total_ticks(midi_file) -> int:
     return max((sum(msg.time for msg in t) for t in midi_file.tracks), default=0)
 
 
-def generate_metronome_track(ticks_per_beat: int, total_ticks: int) -> mido.MidiTrack:
+def generate_metronome_track(
+    ticks_per_beat: int,
+    total_ticks: int,
+    instrument: tuple[int, int] | None = None,
+) -> mido.MidiTrack:
     track = mido.MidiTrack()
     track.name = "Metronome"
-    # metronome.sf2 has the woodblock as Bank 0 / Preset 115 (melodic, not percussion).
-    # Use channel 15 (unlikely to clash with piano tracks) and select that preset.
+    # Default to the bundled metronome soundfont's woodblock preset.
     ch = 15
+    bank, program = instrument or (0, 115)
+    bank_msb, bank_lsb = bank // 128, bank % 128
     note = 60   # root pitch of the High Woodblock sample
     note_dur = max(5, ticks_per_beat // 8)
-    track.append(mido.Message("control_change", channel=ch, control=0, value=0, time=0))
-    track.append(mido.Message("program_change", channel=ch, program=115, time=0))
+    track.append(mido.Message("control_change", channel=ch, control=0, value=bank_msb, time=0))
+    track.append(mido.Message("control_change", channel=ch, control=32, value=bank_lsb, time=0))
+    track.append(mido.Message("program_change", channel=ch, program=program, time=0))
     last_tick = 0
     beat = 0
     while True:
@@ -258,7 +265,8 @@ def _apply_metro_vel(track: mido.MidiTrack, metro_vel: int) -> mido.MidiTrack:
 
 
 def build_output_midi(src, active_idx, normal_velocity, quiet_velocity, speed,
-                      track_levels=None, metro_track=None, metro_vel=None):
+                      track_levels=None, metro_track=None, metro_vel=None,
+                      track_instruments=None):
     """Export one track at normal_velocity ceiling; other tracks follow their Level setting."""
     out_type = 1 if (metro_track is not None or len(src.tracks) > 1) else src.type
     out = mido.MidiFile(type=out_type, ticks_per_beat=src.ticks_per_beat)
@@ -282,7 +290,8 @@ def build_output_midi(src, active_idx, normal_velocity, quiet_velocity, speed,
                     new_track.append(msg.copy(velocity=0))
             else:
                 new_track.append(msg)
-        out.tracks.append(new_track)
+        instrument = track_instruments.get(ti) if track_instruments else None
+        out.tracks.append(_with_instrument_override(new_track, instrument))
 
     if metro_track is not None:
         mv = metro_vel if metro_vel is not None else max(1, int(qv * 0.8))
@@ -291,7 +300,7 @@ def build_output_midi(src, active_idx, normal_velocity, quiet_velocity, speed,
 
 
 def build_preview_midi(src, solo_idx, normal_velocity, quiet_velocity, speed, track_levels,
-                       metro_track=None, metro_vel=None):
+                       metro_track=None, metro_vel=None, track_instruments=None):
     out_type = 1 if (metro_track is not None or len(src.tracks) > 1) else src.type
     out = mido.MidiFile(type=out_type, ticks_per_beat=src.ticks_per_beat)
     nv, qv = normal_velocity, quiet_velocity
@@ -315,7 +324,8 @@ def build_preview_midi(src, solo_idx, normal_velocity, quiet_velocity, speed, tr
                         new_track.append(msg.copy(velocity=0))
             else:
                 new_track.append(msg)
-        out.tracks.append(new_track)
+        instrument = track_instruments.get(ti) if track_instruments else None
+        out.tracks.append(_with_instrument_override(new_track, instrument))
 
     if metro_track is not None:
         mv = metro_vel if metro_vel is not None else max(1, int(qv * 0.8))
@@ -340,6 +350,44 @@ _SF2_SEARCH_PATHS = [
     "/usr/local/Cellar/fluid-synth/*/share/fluid-synth/sf2/VintageDreamsWaves-v2.sf2",
 ]
 
+_GM_PROGRAM_NAMES = [
+    "Acoustic Grand Piano", "Bright Acoustic Piano", "Electric Grand Piano", "Honky-tonk Piano",
+    "Electric Piano 1", "Electric Piano 2", "Harpsichord", "Clavi",
+    "Celesta", "Glockenspiel", "Music Box", "Vibraphone",
+    "Marimba", "Xylophone", "Tubular Bells", "Dulcimer",
+    "Drawbar Organ", "Percussive Organ", "Rock Organ", "Church Organ",
+    "Reed Organ", "Accordion", "Harmonica", "Tango Accordion",
+    "Acoustic Guitar (nylon)", "Acoustic Guitar (steel)", "Electric Guitar (jazz)", "Electric Guitar (clean)",
+    "Electric Guitar (muted)", "Overdriven Guitar", "Distortion Guitar", "Guitar Harmonics",
+    "Acoustic Bass", "Electric Bass (finger)", "Electric Bass (pick)", "Fretless Bass",
+    "Slap Bass 1", "Slap Bass 2", "Synth Bass 1", "Synth Bass 2",
+    "Violin", "Viola", "Cello", "Contrabass",
+    "Tremolo Strings", "Pizzicato Strings", "Orchestral Harp", "Timpani",
+    "String Ensemble 1", "String Ensemble 2", "SynthStrings 1", "SynthStrings 2",
+    "Choir Aahs", "Voice Oohs", "Synth Voice", "Orchestra Hit",
+    "Trumpet", "Trombone", "Tuba", "Muted Trumpet",
+    "French Horn", "Brass Section", "SynthBrass 1", "SynthBrass 2",
+    "Soprano Sax", "Alto Sax", "Tenor Sax", "Baritone Sax",
+    "Oboe", "English Horn", "Bassoon", "Clarinet",
+    "Piccolo", "Flute", "Recorder", "Pan Flute",
+    "Blown Bottle", "Shakuhachi", "Whistle", "Ocarina",
+    "Lead 1 (square)", "Lead 2 (sawtooth)", "Lead 3 (calliope)", "Lead 4 (chiff)",
+    "Lead 5 (charang)", "Lead 6 (voice)", "Lead 7 (fifths)", "Lead 8 (bass + lead)",
+    "Pad 1 (new age)", "Pad 2 (warm)", "Pad 3 (polysynth)", "Pad 4 (choir)",
+    "Pad 5 (bowed)", "Pad 6 (metallic)", "Pad 7 (halo)", "Pad 8 (sweep)",
+    "FX 1 (rain)", "FX 2 (soundtrack)", "FX 3 (crystal)", "FX 4 (atmosphere)",
+    "FX 5 (brightness)", "FX 6 (goblins)", "FX 7 (echoes)", "FX 8 (sci-fi)",
+    "Sitar", "Banjo", "Shamisen", "Koto",
+    "Kalimba", "Bag pipe", "Fiddle", "Shanai",
+    "Tinkle Bell", "Agogo", "Steel Drums", "Woodblock",
+    "Taiko Drum", "Melodic Tom", "Synth Drum", "Reverse Cymbal",
+    "Guitar Fret Noise", "Breath Noise", "Seashore", "Bird Tweet",
+    "Telephone Ring", "Helicopter", "Applause", "Gunshot",
+]
+
+_SF_PRESET_RE = re.compile(r"^\s*(\d+)-(\d+)\s+(.+?)\s*$")
+_SF_PRESET_CACHE: dict[str, list[tuple[int, int, str]]] = {}
+
 
 def find_soundfont() -> str:
     for pattern in _SF2_SEARCH_PATHS:
@@ -349,12 +397,130 @@ def find_soundfont() -> str:
     return ""
 
 
-def _render_midi_to_wav(midi_path: str, wav_path: str, sf: str) -> None:
+def _gm_presets() -> list[tuple[int, int, str]]:
+    return [(0, program, name) for program, name in enumerate(_GM_PROGRAM_NAMES)]
+
+
+def list_soundfont_presets(sf_path: str) -> list[tuple[int, int, str]]:
+    """Return (bank, program, name) presets for a SoundFont."""
+    if not sf_path:
+        return []
+    key = os.path.abspath(sf_path)
+    if key in _SF_PRESET_CACHE:
+        return _SF_PRESET_CACHE[key]
+    if not os.path.isfile(sf_path):
+        _SF_PRESET_CACHE[key] = []
+        return []
+
+    presets: list[tuple[int, int, str]] = []
+    if shutil.which("fluidsynth"):
+        try:
+            proc = subprocess.run(
+                ["fluidsynth", "-a", "file", "-n", sf_path],
+                input="inst 1\nquit\n",
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            found: dict[tuple[int, int], str] = {}
+            for line in proc.stdout.splitlines():
+                match = _SF_PRESET_RE.match(line)
+                if not match:
+                    continue
+                bank, program = int(match.group(1)), int(match.group(2))
+                found[(bank, program)] = match.group(3).strip()
+            presets = [(bank, program, name) for (bank, program), name in sorted(found.items())]
+        except Exception:
+            presets = []
+
+    if not presets:
+        presets = _gm_presets()
+
+    _SF_PRESET_CACHE[key] = presets
+    return presets
+
+
+def _track_channels(track: mido.MidiTrack) -> list[int]:
+    return sorted({msg.channel for msg in track if hasattr(msg, "channel")})
+
+
+def _with_instrument_override(
+    track: mido.MidiTrack, instrument: tuple[int, int] | None
+) -> mido.MidiTrack:
+    if instrument is None:
+        return track
+
+    channels = _track_channels(track)
+    if not channels:
+        return track
+
+    bank, program = instrument
+    bank_msb, bank_lsb = bank // 128, bank % 128
+    overridden = mido.MidiTrack()
+
+    idx = 0
+    while idx < len(track):
+        msg = track[idx]
+        if msg.time != 0 or hasattr(msg, "channel"):
+            break
+        overridden.append(msg.copy())
+        idx += 1
+
+    for channel in channels:
+        overridden.append(mido.Message("control_change", channel=channel, control=0, value=bank_msb, time=0))
+        overridden.append(mido.Message("control_change", channel=channel, control=32, value=bank_lsb, time=0))
+        overridden.append(mido.Message("program_change", channel=channel, program=program, time=0))
+
+    carry_time = 0
+    for msg in track[idx:]:
+        is_bank_select = (
+            msg.type == "control_change"
+            and getattr(msg, "control", None) in (0, 32)
+            and hasattr(msg, "channel")
+        )
+        is_program_change = msg.type == "program_change" and hasattr(msg, "channel")
+        if is_bank_select or is_program_change:
+            carry_time += msg.time
+            continue
+        overridden.append(msg.copy(time=msg.time + carry_time))
+        carry_time = 0
+
+    return overridden
+
+
+def _normalize_instrument_data(data) -> tuple[int, int] | None:
+    if isinstance(data, (tuple, list)) and len(data) == 2:
+        return int(data[0]), int(data[1])
+    return None
+
+
+def _fluidsynth_bool(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def _build_fx_options(fx_settings: dict | None) -> list[str]:
+    settings = fx_settings or {}
+    return [
+        "-o", f"synth.reverb.active={_fluidsynth_bool(settings.get('reverb_enabled', True))}",
+        "-o", f"synth.reverb.room-size={settings.get('reverb_room_size', 0.5):.2f}",
+        "-o", f"synth.reverb.level={settings.get('reverb_level', 0.7):.2f}",
+        "-o", f"synth.chorus.active={_fluidsynth_bool(settings.get('chorus_enabled', True))}",
+        "-o", f"synth.chorus.depth={settings.get('chorus_depth', 4.25):.2f}",
+        "-o", f"synth.chorus.level={settings.get('chorus_level', 0.6):.2f}",
+    ]
+
+
+def _render_midi_to_wav(midi_path: str, wav_path: str, sf: str, fx_settings: dict | None = None) -> None:
     bin_ = shutil.which("fluidsynth")
     if not bin_:
         raise RuntimeError("fluidsynth not found.\n\nInstall:  brew install fluid-synth  (macOS)")
+    cmd = [
+        bin_, "-ni", "-g", "1.0",
+        *_build_fx_options(fx_settings),
+        "-F", wav_path, "-r", "44100", sf, midi_path,
+    ]
     result = subprocess.run(
-        [bin_, "-ni", "-g", "1.0", "-F", wav_path, "-r", "44100", sf, midi_path],
+        cmd,
         capture_output=True, text=True,
     )
     if not os.path.isfile(wav_path) or os.path.getsize(wav_path) == 0:
@@ -396,17 +562,17 @@ def _extract_tracks_midi(src: mido.MidiFile, include_indices: set) -> mido.MidiF
     return out
 
 
-def _mix_wav_files(wav_paths: list[str], out_path: str) -> None:
-    """Sum multiple WAV files into one, clamping to prevent clipping."""
+def _mix_wav_files(wav_parts: list[tuple[str, float]], out_path: str) -> None:
+    """Sum multiple WAV files into one, applying linear gain per file."""
     arrays, params, max_len = [], None, 0
-    for path in wav_paths:
+    for path, gain in wav_parts:
         with wave.open(path, "rb") as wf:
             p = wf.getparams()
             if params is None:
                 params = p
             raw = wf.readframes(wf.getnframes())
         dtype = {1: np.int8, 2: np.int16, 4: np.int32}.get(p.sampwidth, np.int16)
-        arr = np.frombuffer(raw, dtype=dtype).astype(np.float64)
+        arr = np.frombuffer(raw, dtype=dtype).astype(np.float64) * gain
         arrays.append(arr)
         max_len = max(max_len, len(arr))
     mixed = np.zeros(max_len, dtype=np.float64)
@@ -430,10 +596,14 @@ def _render_with_sf_map(
     global_sf: str,
     metro_sf: str,
     wav_path: str,
+    fx_settings: dict | None = None,
+    track_gains: dict[int, float] | None = None,
 ) -> None:
     """Render output_midi to wav_path, routing each track through its soundfont."""
-    sf_groups: dict[str, list[int]] = {}
+    sf_groups: dict[tuple[str, float], list[int]] = {}
     for ti in range(len(output_midi.tracks)):
+        if track_note_count(output_midi.tracks[ti]) == 0:
+            continue
         sf = (track_sf_map.get(ti, "") if ti < n_src_tracks else metro_sf) or global_sf
         if not sf:
             raise RuntimeError(
@@ -441,27 +611,35 @@ def _render_with_sf_map(
                 "Select one with Browse. A free GM soundfont (GeneralUser GS, FluidR3 GM)\n"
                 "will give you grand piano and all standard instruments."
             )
-        sf_groups.setdefault(sf, []).append(ti)
+        gain = float(track_gains.get(ti, 1.0)) if track_gains else 1.0
+        if gain <= 0:
+            continue
+        sf_groups.setdefault((sf, gain), []).append(ti)
+
+    if not sf_groups:
+        raise RuntimeError("Nothing to render.\n\nThe selected export contains no audible notes.")
 
     tmp_files: list[str] = []
     try:
-        if len(sf_groups) == 1:
-            sf = next(iter(sf_groups))
+        full_track_count = sum(len(indices) for indices in sf_groups.values())
+        single_group = len(sf_groups) == 1
+        (sf, gain), indices = next(iter(sf_groups.items()))
+        if single_group and gain == 1.0 and full_track_count == len(output_midi.tracks):
             with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as f:
                 output_midi.save(file=f)
                 tmp_files.append(f.name)
-            _render_midi_to_wav(f.name, wav_path, sf)
+            _render_midi_to_wav(f.name, wav_path, sf, fx_settings)
         else:
-            wav_parts: list[str] = []
-            for sf, indices in sf_groups.items():
+            wav_parts: list[tuple[str, float]] = []
+            for (sf, gain), indices in sf_groups.items():
                 partial = _extract_tracks_midi(output_midi, set(indices))
                 with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as f:
                     partial.save(file=f)
                     tmp_files.append(f.name)
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as g:
                     tmp_files.append(g.name)
-                _render_midi_to_wav(f.name, g.name, sf)
-                wav_parts.append(g.name)
+                _render_midi_to_wav(f.name, g.name, sf, fx_settings)
+                wav_parts.append((g.name, gain))
             _mix_wav_files(wav_parts, wav_path)
         _normalize_wav(wav_path)
     finally:
@@ -522,17 +700,20 @@ class PreviewWorker(QObject):
         self._sf_map: dict = {}
         self._metro_sf: str = ""
         self._n_src_tracks: int = 0
+        self._fx_settings: dict = {}
 
     # ── public ────────────────────────────────────────────────────────────
 
     def play(self, midi_file, sound_font: str = "",
-             sf_map: dict | None = None, metro_sf: str = "", n_src_tracks: int = 0):
+             sf_map: dict | None = None, metro_sf: str = "", n_src_tracks: int = 0,
+             fx_settings: dict | None = None):
         self.stop()
         self._stop_ev = threading.Event()
         self._is_paused = False
         self._sf_map = sf_map or {}
         self._metro_sf = metro_sf
         self._n_src_tracks = n_src_tracks
+        self._fx_settings = fx_settings or {}
         any_sf = sound_font or any(self._sf_map.values()) or metro_sf
         self._audio_mode = bool(any_sf)
         if self._audio_mode:
@@ -615,7 +796,7 @@ class PreviewWorker(QObject):
         try:
             _render_with_sf_map(
                 midi_file, self._n_src_tracks, self._sf_map,
-                sound_font, self._metro_sf, wav)
+                sound_font, self._metro_sf, wav, self._fx_settings)
         except Exception as e:
             try: os.unlink(wav)
             except Exception: pass
@@ -805,6 +986,7 @@ _MUTE_OFF = ""   # inherits global QPushButton style
 class TrackRow(QWidget):
     solo_clicked  = pyqtSignal(int)
     level_changed = pyqtSignal(int, str)
+    rendering_changed = pyqtSignal(int)
 
     def __init__(self, track_idx, track_name, note_count, parent=None):
         super().__init__(parent)
@@ -824,6 +1006,14 @@ class TrackRow(QWidget):
         self.name_edit.setFixedHeight(26)
         self.name_edit.setToolTip("Edit to customise export filename")
         layout.addWidget(self.name_edit, stretch=1)
+
+        self._global_sf_path = ""
+        self.instrument_combo = QComboBox()
+        self.instrument_combo.setFixedHeight(26)
+        self.instrument_combo.setFixedWidth(180)
+        self.instrument_combo.setToolTip("Pick an instrument preset from the active soundfont")
+        self.instrument_combo.currentIndexChanged.connect(self._on_instrument_changed)
+        layout.addWidget(self.instrument_combo)
 
         self._sf_path = ""
         self.sf_btn = QPushButton("SF…")
@@ -882,9 +1072,47 @@ class TrackRow(QWidget):
             self.sf_btn.setStyleSheet(
                 f"border:1.5px solid {_C_PRIMARY_BORDER};border-radius:8px;font-size:11px;"
                 f"background:{_C_PRIMARY_BG};color:{_C_PRIMARY_DARK};")
+            self.refresh_instruments(self._global_sf_path)
+            self.rendering_changed.emit(self.track_idx)
 
     def get_soundfont(self) -> str:
         return self._sf_path
+
+    def get_effective_soundfont(self, global_sf_path: str = "") -> str:
+        return self._sf_path or global_sf_path or self._global_sf_path
+
+    def refresh_instruments(self, global_sf_path: str = ""):
+        self._global_sf_path = global_sf_path
+        current = self.get_instrument_override()
+        effective_sf = self.get_effective_soundfont(global_sf_path)
+        presets = list_soundfont_presets(effective_sf) if effective_sf else []
+
+        self.instrument_combo.blockSignals(True)
+        self.instrument_combo.clear()
+        self.instrument_combo.addItem("Keep MIDI instrument", None)
+        for bank, program, name in presets:
+            self.instrument_combo.addItem(f"{bank:03d}-{program:03d} {name}", (bank, program))
+
+        index = 0
+        if current is not None:
+            for i in range(self.instrument_combo.count()):
+                data = _normalize_instrument_data(self.instrument_combo.itemData(i))
+                if data == current:
+                    index = i
+                    break
+        self.instrument_combo.setCurrentIndex(index)
+        self.instrument_combo.setEnabled(self.instrument_combo.count() > 1)
+        if effective_sf:
+            self.instrument_combo.setToolTip(f"Instrument presets from:\n{effective_sf}")
+        else:
+            self.instrument_combo.setToolTip("Choose a soundfont to unlock instrument presets")
+        self.instrument_combo.blockSignals(False)
+
+    def get_instrument_override(self) -> tuple[int, int] | None:
+        return _normalize_instrument_data(self.instrument_combo.currentData())
+
+    def _on_instrument_changed(self, _index: int):
+        self.rendering_changed.emit(self.track_idx)
 
     def _on_mute_toggled(self, checked: bool):
         self.mute_btn.setStyleSheet(_MUTE_ON if checked else _MUTE_OFF)
@@ -1185,6 +1413,7 @@ class MainWindow(QMainWindow):
         sf_browse_btn.clicked.connect(self._browse_soundfont)
         tr_row.addWidget(sf_browse_btn)
         sf_v.addLayout(tr_row)
+        self.sf_edit.textChanged.connect(self._refresh_track_instrument_options)
 
         # Metronome SF row
         mt_row = QHBoxLayout()
@@ -1205,6 +1434,7 @@ class MainWindow(QMainWindow):
         metro_sf_btn.clicked.connect(self._browse_metro_sf)
         mt_row.addWidget(metro_sf_btn)
         sf_v.addLayout(mt_row)
+        self.metro_sf_edit.textChanged.connect(self._on_metro_soundfont_changed)
         v.addWidget(sf_card)
 
         v.addStretch()
@@ -1246,7 +1476,7 @@ class MainWindow(QMainWindow):
         name_lbl.setMinimumWidth(120)
         hdr_l.addWidget(name_lbl, stretch=1)
         # Fixed-width columns
-        for text, fw in [("SF", 90), ("Solo", 80), ("Mute", 70), ("Notes", 50), ("Export", 44)]:
+        for text, fw in [("Inst", 180), ("SF", 90), ("Solo", 80), ("Mute", 70), ("Notes", 50), ("Export", 44)]:
             lbl = QLabel(text)
             lbl.setFixedWidth(fw)
             hdr_l.addWidget(lbl)
@@ -1314,8 +1544,55 @@ class MainWindow(QMainWindow):
             return row
 
         vol_v.addLayout(_slider_row("Normal volume:", 100, "normal_lbl", "normal_slider"))
-        vol_v.addLayout(_slider_row("Quiet volume:",   30, "quiet_lbl",  "quiet_slider"))
+        vol_v.addLayout(_slider_row("Quiet volume:",   20, "quiet_lbl",  "quiet_slider"))
         v.addWidget(vol_card)
+
+        # ── Audio Effects ───────────────────────────────────────────────
+        fx_card, fx_v = self._card("Audio Effects")
+        fx_hint = QLabel(
+            "These controls affect FluidSynth-based preview and WAV/MP3 export. "
+            "MIDI exports stay dry because they do not contain rendered audio.")
+        fx_hint.setWordWrap(True)
+        fx_hint.setStyleSheet("color:#64748b;font-size:12px;")
+        fx_v.addWidget(fx_hint)
+
+        fx_top = QHBoxLayout()
+        fx_top.setSpacing(16)
+        self.reverb_toggle = QCheckBox("Enable reverb")
+        self.reverb_toggle.setChecked(False)
+        fx_top.addWidget(self.reverb_toggle)
+        self.chorus_toggle = QCheckBox("Enable chorus")
+        self.chorus_toggle.setChecked(False)
+        fx_top.addWidget(self.chorus_toggle)
+        fx_top.addStretch()
+        fx_v.addLayout(fx_top)
+
+        def _fx_slider_row(label: str, minimum: int, maximum: int, default: int,
+                           slider_attr: str, value_attr: str, suffix: str = ""):
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            lbl = QLabel(label)
+            lbl.setFixedWidth(120)
+            row.addWidget(lbl)
+            sl = QSlider(Qt.Orientation.Horizontal)
+            sl.setRange(minimum, maximum)
+            sl.setValue(default)
+            sl.setMinimumWidth(180)
+            row.addWidget(sl)
+            value_lbl = QLabel(f"{default}{suffix}")
+            value_lbl.setFixedWidth(52)
+            row.addWidget(value_lbl)
+            sl.valueChanged.connect(lambda val, _lbl=value_lbl, _suffix=suffix: _lbl.setText(f"{val}{_suffix}"))
+            row.addStretch()
+            setattr(self, slider_attr, sl)
+            setattr(self, value_attr, value_lbl)
+            return row
+
+        fx_v.addLayout(_fx_slider_row("Reverb wetness:", 0, 100, 70, "reverb_level_slider", "reverb_level_lbl", "%"))
+        fx_v.addLayout(_fx_slider_row("Room size:", 0, 100, 50, "reverb_room_slider", "reverb_room_lbl", "%"))
+        fx_v.addLayout(_fx_slider_row("Chorus wetness:", 0, 100, 60, "chorus_level_slider", "chorus_level_lbl", "%"))
+        fx_v.addLayout(_fx_slider_row("Chorus depth:", 0, 256, 4, "chorus_depth_slider", "chorus_depth_lbl"))
+        v.addWidget(fx_card)
 
         # ── Metronome ──────────────────────────────────────────────────
         metro_card, metro_v = self._card("Metronome")
@@ -1323,7 +1600,7 @@ class MainWindow(QMainWindow):
         metro_top = QHBoxLayout()
         metro_top.setSpacing(16)
         self.metro_toggle = QCheckBox("Enable metronome")
-        self.metro_toggle.setChecked(False)
+        self.metro_toggle.setChecked(True)
         metro_top.addWidget(self.metro_toggle)
         self.metro_export_cb = QCheckBox("Include in export")
         self.metro_export_cb.setChecked(True)
@@ -1338,17 +1615,47 @@ class MainWindow(QMainWindow):
         metro_vol_row.addWidget(mvl)
         self.metro_vol_slider = QSlider(Qt.Orientation.Horizontal)
         self.metro_vol_slider.setRange(1, 127)
-        self.metro_vol_slider.setValue(35)
+        self.metro_vol_slider.setValue(20)
         self.metro_vol_slider.setMinimumWidth(160)
         metro_vol_row.addWidget(self.metro_vol_slider)
-        self.metro_vol_lbl = QLabel("35")
+        self.metro_vol_lbl = QLabel("20")
         self.metro_vol_lbl.setFixedWidth(28)
         metro_vol_row.addWidget(self.metro_vol_lbl)
         self.metro_vol_slider.valueChanged.connect(
             lambda val: self.metro_vol_lbl.setText(str(val)))
         metro_vol_row.addStretch()
         metro_v.addLayout(metro_vol_row)
+
+        metro_inst_row = QHBoxLayout()
+        metro_inst_row.setSpacing(10)
+        mil = QLabel("Instrument:")
+        mil.setFixedWidth(90)
+        metro_inst_row.addWidget(mil)
+        self.metro_instrument_combo = QComboBox()
+        self.metro_instrument_combo.setFixedHeight(30)
+        self.metro_instrument_combo.setMinimumWidth(260)
+        self.metro_instrument_combo.setToolTip("Pick the metronome preset from the active metronome soundfont")
+        self.metro_instrument_combo.currentIndexChanged.connect(self._on_metro_rendering_changed)
+        metro_inst_row.addWidget(self.metro_instrument_combo)
+        metro_inst_row.addStretch()
+        metro_v.addLayout(metro_inst_row)
         v.addWidget(metro_card)
+
+        for widget in [
+            self.reverb_toggle,
+            self.chorus_toggle,
+            self.reverb_level_slider,
+            self.reverb_room_slider,
+            self.chorus_level_slider,
+            self.chorus_depth_slider,
+        ]:
+            if isinstance(widget, QCheckBox):
+                widget.toggled.connect(self._on_fx_settings_changed)
+            else:
+                widget.sliderReleased.connect(self._on_fx_settings_changed)
+
+        self._update_fx_control_state()
+        self._refresh_metro_instrument_options()
 
         v.addStretch()
         return w
@@ -1468,6 +1775,8 @@ class MainWindow(QMainWindow):
             row = TrackRow(i, name, nc)
             row.solo_clicked.connect(self._toggle_solo)
             row.level_changed.connect(self._on_level_changed)
+            row.rendering_changed.connect(self._on_track_rendering_changed)
+            row.refresh_instruments(self._get_soundfont())
             if visible % 2 != 0:
                 row.setObjectName(f"rowAlt{id(row)}")
                 row.setStyleSheet(f"QWidget#rowAlt{id(row)} {{ background:#fafbff; }}")
@@ -1479,28 +1788,121 @@ class MainWindow(QMainWindow):
 
     # ── metronome / settings helpers ──────────────────────────────────────
 
+    def _get_effective_metro_sf(self) -> str:
+        return self._get_metro_sf() or self._get_soundfont()
+
+    def _default_metro_instrument(self) -> tuple[int, int] | None:
+        presets = list_soundfont_presets(self._get_effective_metro_sf())
+        if not presets:
+            return None
+        for bank, program, _name in presets:
+            if (bank, program) == (0, 115):
+                return bank, program
+        bank, program, _name = presets[0]
+        return bank, program
+
+    def _get_metro_instrument(self) -> tuple[int, int] | None:
+        data = _normalize_instrument_data(self.metro_instrument_combo.currentData())
+        return data or self._default_metro_instrument()
+
+    def _refresh_metro_instrument_options(self):
+        current = _normalize_instrument_data(
+            self.metro_instrument_combo.currentData()
+        ) if hasattr(self, "metro_instrument_combo") else None
+        effective_sf = self._get_effective_metro_sf()
+        presets = list_soundfont_presets(effective_sf) if effective_sf else []
+
+        self.metro_instrument_combo.blockSignals(True)
+        self.metro_instrument_combo.clear()
+        for bank, program, name in presets:
+            self.metro_instrument_combo.addItem(f"{bank:03d}-{program:03d} {name}", (bank, program))
+
+        target = current or self._default_metro_instrument()
+        index = 0
+        if target is not None:
+            for i in range(self.metro_instrument_combo.count()):
+                data = _normalize_instrument_data(self.metro_instrument_combo.itemData(i))
+                if data == target:
+                    index = i
+                    break
+        if self.metro_instrument_combo.count() > 0:
+            self.metro_instrument_combo.setCurrentIndex(index)
+        self.metro_instrument_combo.setEnabled(self.metro_instrument_combo.count() > 0)
+        if effective_sf:
+            self.metro_instrument_combo.setToolTip(f"Metronome presets from:\n{effective_sf}")
+        else:
+            self.metro_instrument_combo.setToolTip("Choose a metronome or tracks soundfont to unlock metronome presets")
+        self.metro_instrument_combo.blockSignals(False)
+
     def _get_metro_track(self):
         if not self.metro_toggle.isChecked() or self.midi_file is None:
             return None
-        return generate_metronome_track(self.midi_file.ticks_per_beat, get_total_ticks(self.midi_file))
+        return generate_metronome_track(
+            self.midi_file.ticks_per_beat,
+            get_total_ticks(self.midi_file),
+            self._get_metro_instrument(),
+        )
 
     def _get_metro_track_for_export(self):
         if not self.metro_toggle.isChecked() or not self.metro_export_cb.isChecked():
             return None
         if self.midi_file is None:
             return None
-        return generate_metronome_track(self.midi_file.ticks_per_beat, get_total_ticks(self.midi_file))
+        return generate_metronome_track(
+            self.midi_file.ticks_per_beat,
+            get_total_ticks(self.midi_file),
+            self._get_metro_instrument(),
+        )
 
     def _get_metro_vel(self):   return self.metro_vol_slider.value()
     def _get_speed(self):       return self.speed_slider.value() / 100.0
     def _get_normal_vel(self):  return self.normal_slider.value()
     def _get_quiet_vel(self):   return self.quiet_slider.value()
+    def _get_quiet_audio_gain(self) -> float:
+        return min(1.0, self._get_quiet_vel() / max(1, self._get_normal_vel()))
+    def _get_fx_settings(self) -> dict:
+        return {
+            "reverb_enabled": self.reverb_toggle.isChecked(),
+            "reverb_room_size": self.reverb_room_slider.value() / 100.0,
+            "reverb_level": self.reverb_level_slider.value() / 100.0,
+            "chorus_enabled": self.chorus_toggle.isChecked(),
+            "chorus_level": self.chorus_level_slider.value() / 100.0,
+            "chorus_depth": float(self.chorus_depth_slider.value()),
+        }
     def _get_levels(self):
         levels = ["muted"] * len(self.midi_file.tracks)
         for r in self.track_rows:
             levels[r.track_idx] = r.get_level()
         return levels
     def _get_soundfont(self):  return self.sf_edit.text().strip()
+    def _get_track_instrument_map(self) -> dict:
+        return {
+            r.track_idx: r.get_instrument_override()
+            for r in self.track_rows
+            if r.get_instrument_override() is not None
+        }
+
+    def _build_render_track_gains(
+        self, active_idx: int | None, other_mode: str, include_metro: bool
+    ) -> dict[int, float]:
+        if self.midi_file is None:
+            return {}
+        gains = {ti: 1.0 for ti in range(len(self.midi_file.tracks))}
+        quiet_gain = self._get_quiet_audio_gain()
+        for row in self.track_rows:
+            if row.get_level() == "muted":
+                gains[row.track_idx] = 0.0
+            elif active_idx is not None and row.track_idx == active_idx:
+                gains[row.track_idx] = 1.0
+            elif other_mode == "quiet":
+                gains[row.track_idx] = quiet_gain
+            elif other_mode == "muted":
+                gains[row.track_idx] = 0.0
+            else:
+                gains[row.track_idx] = 1.0
+        if include_metro:
+            gains[len(self.midi_file.tracks)] = 1.0
+        return gains
 
     # ── playback ──────────────────────────────────────────────────────────
 
@@ -1522,12 +1924,12 @@ class MainWindow(QMainWindow):
         preview = build_preview_midi(
             self.midi_file, None,
             self._get_normal_vel(), self._get_quiet_vel(), self._get_speed(), self._get_levels(),
-            self._get_metro_track(), self._get_metro_vel(),
+            self._get_metro_track(), self._get_metro_vel(), self._get_track_instrument_map(),
         )
         self.current_solo = -1
         self.worker.play(preview, self._get_soundfont(),
                          self._get_track_sf_map(), self._get_metro_sf(),
-                         len(self.midi_file.tracks))
+                         len(self.midi_file.tracks), self._get_fx_settings())
         self._set_play_btn_state("playing")
         self.status_lbl.setText("Playing mix…")
 
@@ -1540,11 +1942,11 @@ class MainWindow(QMainWindow):
         preview = build_preview_midi(
             self.midi_file, track_idx,
             self._get_normal_vel(), self._get_quiet_vel(), self._get_speed(), [],
-            self._get_metro_track(), self._get_metro_vel(),
+            self._get_metro_track(), self._get_metro_vel(), self._get_track_instrument_map(),
         )
         self.worker.play(preview, self._get_soundfont(),
                          self._get_track_sf_map(), self._get_metro_sf(),
-                         len(self.midi_file.tracks))
+                         len(self.midi_file.tracks), self._get_fx_settings())
         for row in self.track_rows:
             row.set_solo_active(row.track_idx == track_idx)
         self._set_play_btn_state("playing")
@@ -1639,6 +2041,16 @@ class MainWindow(QMainWindow):
             self._stop()
             self._play_mix()
 
+    def _on_track_rendering_changed(self, _track_idx):
+        self._refresh_preview_if_playing()
+
+    def _on_metro_rendering_changed(self, _index: int = -1):
+        self._refresh_preview_if_playing()
+
+    def _on_fx_settings_changed(self):
+        self._update_fx_control_state()
+        self._refresh_preview_if_playing()
+
     def _tick_position(self):
         if not self.worker.is_playing() and not self.worker.is_paused():
             self._pos_timer.stop()
@@ -1671,10 +2083,40 @@ class MainWindow(QMainWindow):
     def _get_track_sf_map(self) -> dict:
         return {r.track_idx: r.get_soundfont() for r in self.track_rows}
 
+    def _refresh_track_instrument_options(self):
+        global_sf = self._get_soundfont()
+        for row in self.track_rows:
+            row.refresh_instruments(global_sf)
+        if not self._get_metro_sf():
+            self._refresh_metro_instrument_options()
+
+    def _on_metro_soundfont_changed(self):
+        self._refresh_metro_instrument_options()
+        self._refresh_preview_if_playing()
+
+    def _update_fx_control_state(self):
+        reverb_on = self.reverb_toggle.isChecked()
+        chorus_on = self.chorus_toggle.isChecked()
+        self.reverb_level_slider.setEnabled(reverb_on)
+        self.reverb_room_slider.setEnabled(reverb_on)
+        self.chorus_level_slider.setEnabled(chorus_on)
+        self.chorus_depth_slider.setEnabled(chorus_on)
+
+    def _refresh_preview_if_playing(self):
+        if not self.worker.is_playing() or self.midi_file is None:
+            return
+        solo_idx = self.current_solo
+        self._stop()
+        if solo_idx == -1:
+            self._play_mix()
+        else:
+            self._toggle_solo(solo_idx)
+
     # ── export ────────────────────────────────────────────────────────────
 
     def _save_midi_file(self, out_midi, out_path: str, fmt: str,
-                        errors: list, label: str) -> bool:
+                        errors: list, label: str,
+                        track_gains: dict[int, float] | None = None) -> bool:
         """Save out_midi to out_path in the given format. Returns True on success."""
         if fmt == "mid":
             out_midi.save(out_path)
@@ -1686,7 +2128,7 @@ class MainWindow(QMainWindow):
             _render_with_sf_map(
                 out_midi, len(self.midi_file.tracks),
                 self._get_track_sf_map(), self._get_soundfont(),
-                self._get_metro_sf(), tmp_wav)
+                self._get_metro_sf(), tmp_wav, self._get_fx_settings(), track_gains)
             if fmt == "wav":
                 os.replace(tmp_wav, out_path)
                 tmp_wav = None
@@ -1734,6 +2176,7 @@ class MainWindow(QMainWindow):
         fmt  = ["mp3", "wav", "mid"][self.format_group.checkedId()]
         mode = ["Both (Quiet + Silent)", "All Normal", "Others Quiet", "Others Silent"][
                    self.mode_group.checkedId()]
+        rendered_audio = fmt in {"wav", "mp3"}
 
         n_tracks = len(self.midi_file.tracks)
         total = (1 if mode == "All Normal"
@@ -1770,10 +2213,15 @@ class MainWindow(QMainWindow):
                 for r in self.track_rows:
                     if r.get_level() != "muted":
                         lvls[r.track_idx] = "normal"
+                track_gains = (
+                    self._build_render_track_gains(None, "normal", metro_trk is not None)
+                    if rendered_audio else None
+                )
                 out_midi = build_output_midi(
-                    self.midi_file, -1, nv, qv, speed, lvls, metro_trk, metro_vel)
+                    self.midi_file, -1, nv, qv, speed, lvls, metro_trk, metro_vel,
+                    self._get_track_instrument_map())
                 out_path = os.path.join(out_dir, f"{base}.{fmt}")
-                if self._save_midi_file(out_midi, out_path, fmt, errors, base):
+                if self._save_midi_file(out_midi, out_path, fmt, errors, base, track_gains):
                     count += 1
 
         elif mode == "Others Quiet":
@@ -1781,11 +2229,16 @@ class MainWindow(QMainWindow):
                 name = row.get_export_name()
                 if not advance(name):
                     break
-                lvls = levels_for(row.track_idx, "quiet")
+                lvls = levels_for(row.track_idx, "normal" if rendered_audio else "quiet")
+                track_gains = (
+                    self._build_render_track_gains(row.track_idx, "quiet", metro_trk is not None)
+                    if rendered_audio else None
+                )
                 out_midi = build_output_midi(
-                    self.midi_file, row.track_idx, nv, qv, speed, lvls, metro_trk, metro_vel)
+                    self.midi_file, row.track_idx, nv, qv, speed, lvls, metro_trk, metro_vel,
+                    self._get_track_instrument_map())
                 out_path = os.path.join(out_dir, f"{base}_{name}.{fmt}")
-                if self._save_midi_file(out_midi, out_path, fmt, errors, name):
+                if self._save_midi_file(out_midi, out_path, fmt, errors, name, track_gains):
                     count += 1
                 else:
                     break
@@ -1797,7 +2250,8 @@ class MainWindow(QMainWindow):
                     break
                 lvls = levels_for(row.track_idx, "muted")
                 out_midi = build_output_midi(
-                    self.midi_file, row.track_idx, nv, qv, speed, lvls, metro_trk, metro_vel)
+                    self.midi_file, row.track_idx, nv, qv, speed, lvls, metro_trk, metro_vel,
+                    self._get_track_instrument_map())
                 out_path = os.path.join(out_dir, f"{base}_{name}.{fmt}")
                 if self._save_midi_file(out_midi, out_path, fmt, errors, name):
                     count += 1
@@ -1810,11 +2264,16 @@ class MainWindow(QMainWindow):
 
                 if not advance(f"{name} (quiet)"):
                     break
-                lvls_q = levels_for(row.track_idx, "quiet")
+                lvls_q = levels_for(row.track_idx, "normal" if rendered_audio else "quiet")
+                gains_q = (
+                    self._build_render_track_gains(row.track_idx, "quiet", metro_trk is not None)
+                    if rendered_audio else None
+                )
                 out_q = build_output_midi(
-                    self.midi_file, row.track_idx, nv, qv, speed, lvls_q, metro_trk, metro_vel)
+                    self.midi_file, row.track_idx, nv, qv, speed, lvls_q, metro_trk, metro_vel,
+                    self._get_track_instrument_map())
                 path_q = os.path.join(out_dir, f"{base}_{name}_quiet.{fmt}")
-                if not self._save_midi_file(out_q, path_q, fmt, errors, f"{name}_quiet"):
+                if not self._save_midi_file(out_q, path_q, fmt, errors, f"{name}_quiet", gains_q):
                     break
                 count += 1
 
@@ -1822,7 +2281,8 @@ class MainWindow(QMainWindow):
                     break
                 lvls_s = levels_for(row.track_idx, "muted")
                 out_s = build_output_midi(
-                    self.midi_file, row.track_idx, nv, qv, speed, lvls_s, metro_trk, metro_vel)
+                    self.midi_file, row.track_idx, nv, qv, speed, lvls_s, metro_trk, metro_vel,
+                    self._get_track_instrument_map())
                 path_s = os.path.join(out_dir, f"{base}_{name}_silent.{fmt}")
                 if not self._save_midi_file(out_s, path_s, fmt, errors, f"{name}_silent"):
                     break

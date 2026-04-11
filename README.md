@@ -71,11 +71,28 @@ python midi_splitter.py
 The app is organised as a 4-step wizard. Use **Next / Back** or click any step directly.
 
 1. **Import** — open a MIDI file. Optionally override the soundfonts for tracks or metronome.
-2. **Tracks** — mute or solo individual tracks, rename them, and assign per-track soundfonts. Check the **Export** column to select which tracks to include.
-3. **Settings** — adjust playback speed, normal/quiet volume levels, and metronome (enable, volume, include in export).
+2. **Tracks** — mute or solo individual tracks, rename them, pick an instrument preset from the active soundfont, and assign per-track soundfonts. Check the **Export** column to select which tracks to include.
+3. **Settings** — adjust playback speed, normal/quiet volume levels, FluidSynth reverb/chorus, and metronome (enable, instrument, volume, include in export).
 4. **Export** — pick an export mode, output format, and base filename, then click **Export selected tracks**. A progress bar shows the status for each file.
 
 The waveform and playback controls at the bottom are available at all times. Press **Play mix** to preview with audio.
+
+### Audio effects
+
+When you preview with a soundfont or export to WAV/MP3, you can control:
+
+- Reverb on/off
+- Reverb wetness
+- Reverb room size
+- Chorus on/off
+- Chorus wetness
+- Chorus depth
+
+These controls affect rendered audio only. MIDI exports keep the note data and instrument changes, but do not bake in audio effects.
+
+For WAV/MP3 exports, `Others Quiet` now uses real audio attenuation during rendering instead of only reducing MIDI note velocity, so the backing parts come out more predictably quieter across different soundfonts.
+
+By default, new sessions start with the metronome enabled, quiet volume set to `20`, metronome volume set to `20`, and both reverb and chorus turned off.
 
 ### Export modes
 
@@ -95,4 +112,4 @@ Two soundfonts are included in `soundfonts/` and loaded automatically:
 | `piano.sf2` | All MIDI tracks |
 | `metronome.sf2` | Metronome (High Wood Block, Bank 0 / Preset 115) |
 
-You can override either in the **Import** tab, or assign a different soundfont to individual tracks in the **Tracks** tab.
+You can override either in the **Import** tab, or assign a different soundfont to individual tracks in the **Tracks** tab. Each track row also exposes an **Inst** picker so you can choose the bank/program preset to use from that soundfont for preview and export. The metronome section has its own instrument picker as well, using the metronome soundfont or falling back to the tracks soundfont if no separate metronome soundfont is set.
